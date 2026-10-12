@@ -41,6 +41,7 @@
 #define STATUS_LED_HALF_PERIOD  K_MSEC(500)
 #define LONG_PRESS_THRESHOLD    K_MSEC(600)
 #define RGB_FAST_CYCLE_INTERVAL K_MSEC(150)
+#define BLE_ADV_RETRY_DELAY     K_MSEC(250)
 
 LOG_MODULE_REGISTER(app, LOG_LEVEL_INF);
 
@@ -61,6 +62,7 @@ struct app_context
         bool long_press_started;
         struct k_mutex state_mutex;
         struct k_work_delayable rgb_cycle_work;
+        struct k_work_delayable advertising_restart_work;
 };
 
 static struct app_context app_ctx;
@@ -237,14 +239,29 @@ static int start_advertising(void)
                                   ARRAY_SIZE(advertising_data),
                                   scan_response_data,
                                   ARRAY_SIZE(scan_response_data));
-        if (err)
-        {
-                LOG_ERR("Cannot start BLE advertising (err: %d)", err);
-                return err;
-        }
 
-        LOG_INF("BLE advertising started as %s", device_name);
-        return 0;
+        return err;
+}
+
+static void advertising_restart_work_handler(struct k_work *work)
+{
+        ARG_UNUSED(work);
+
+        int err = start_advertising();
+        if (err == -ENOMEM)
+        {
+                LOG_WRN("BLE resources are still releasing; retrying advertising");
+                k_work_reschedule(&app_ctx.advertising_restart_work,
+                                  BLE_ADV_RETRY_DELAY);
+        }
+        else if (err)
+        {
+                LOG_ERR("Cannot restart BLE advertising (err: %d)", err);
+        }
+        else
+        {
+                LOG_INF("BLE advertising restarted as %s", device_name);
+        }
 }
 
 static void connected(struct bt_conn *conn, uint8_t err)
@@ -266,7 +283,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
         LOG_INF("BLE client disconnected (reason: 0x%02x)", reason);
         button_input_update(true, false);
-        (void)start_advertising();
+        k_work_reschedule(&app_ctx.advertising_restart_work, K_MSEC(100));
 }
 
 BT_CONN_CB_DEFINE(connection_callbacks) = {
@@ -285,6 +302,8 @@ static int configure_io(void)
         }
 
         k_work_init_delayable(&app_ctx.rgb_cycle_work, rgb_cycle_work_handler);
+        k_work_init_delayable(&app_ctx.advertising_restart_work,
+                              advertising_restart_work_handler);
         k_mutex_init(&app_ctx.state_mutex);
 
         err = dk_buttons_init(button_handler);
@@ -317,8 +336,10 @@ int main(void)
         err = start_advertising();
         if (err)
         {
+                LOG_ERR("Cannot start initial BLE advertising (err: %d)", err);
                 return err;
         }
+        LOG_INF("BLE advertising started as %s", device_name);
 
         /* Keep the green status LED blinking at 1 Hz (500 ms per half-cycle). */
         while (true)
